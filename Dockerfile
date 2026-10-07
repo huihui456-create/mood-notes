@@ -1,5 +1,5 @@
 # ---------- 阶段 1：构建前端 ----------
-FROM node:24-alpine AS frontend-builder
+FROM node:22-alpine AS frontend-builder
 
 WORKDIR /build/frontend
 COPY frontend/package*.json ./
@@ -8,7 +8,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---------- 阶段 2：运行后端 ----------
-FROM node:24-alpine
+FROM node:22-alpine
 
 WORKDIR /app
 ENV NODE_ENV=production
