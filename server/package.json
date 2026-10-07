@@ -1,0 +1,15 @@
+{
+  "name": "mood-notes-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "心情笔记后端服务（单用户版，免登录）",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.2",
+    "sharp": "^0.34.1"
+  }
+}

@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    image: mood-notes:latest
+    container_name: mood-notes
+    ports:
+      - "3000:3000"
+    volumes:
+      # 数据持久化：数据库与上传图片都在本目录，备份直接拷贝即可
+      - ./data:/app/data
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
