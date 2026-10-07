@@ -60,6 +60,16 @@ export default function Layout() {
         </div>
       </nav>
 
+      {/* 移动端常驻「我的」入口（页面右上方），游客模式下让出提示条空间 */}
+      <NavLink
+        to="/profile"
+        className="mobile-profile-entry"
+        aria-label="我的"
+        style={mode === 'guest' ? { top: 52 } : undefined}
+      >
+        🌸
+      </NavLink>
+
       <Outlet />
 
       <nav className="bottom-nav">

@@ -668,6 +668,8 @@ body {
   font-weight: 600;
   padding: 8px 16px;
   justify-content: center;
+  position: relative;
+  z-index: 200; /* 高于吸顶导航(z-index:100)，保证「注册保存」按钮可点击 */
 }
 .guest-banner-text { font-weight: 400; color: #B0714A; }
 .guest-banner-btn {
@@ -717,4 +719,27 @@ body {
 @media (max-width: 760px) {
   .top-nav-user { display: none; }
   .guest-banner { font-size: 12px; padding: 6px 12px; }
+  .guest-banner-btn { padding: 2px 10px; font-size: 12px; }
+}
+
+/* ---------- 移动端常驻「我的」入口 ---------- */
+.mobile-profile-entry {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 150; /* 高于吸顶导航 */
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--card);
+  border: 1.5px solid var(--line);
+  box-shadow: var(--shadow);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  font-size: 19px;
+  text-decoration: none;
+}
+@media (max-width: 760px) {
+  .mobile-profile-entry { display: flex; }
 }
