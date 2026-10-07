@@ -7,6 +7,10 @@ import sharp from 'sharp';
 import { readFileSync } from 'node:fs';
 import { db, UPLOAD_DIR, DATA_DIR } from './db.js';
 import { MOOD_MAP, VALID_MOOD_KEYS, trendScore } from './moods.js';
+import {
+  createUser, getUserByUsername, usernameExists, verifyPassword,
+  createSession, getUserByToken, deleteSession
+} from './auth.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -44,7 +48,54 @@ async function saveImage(buffer) {
   return name;
 }
 
-app.post('/api/upload', multerUpload.single('image'), async (req, res) => {
+// ---------- 认证 ----------
+// 通用鉴权中间件：解析 Bearer token，挂在 req.user；未登录返回 401
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const user = getUserByToken(token);
+  if (!user) return res.status(401).json({ error: '请先登录' });
+  req.user = user;
+  req.token = token;
+  next();
+}
+
+// 注册 / 登录 / 登出 / 当前用户
+app.post('/api/auth/register', (req, res) => {
+  const { username, password } = req.body || {};
+  const name = String(username || '').trim();
+  if (!name) return res.status(400).json({ error: '请输入用户名' });
+  if (name.length < 2 || name.length > 20) return res.status(400).json({ error: '用户名长度需为 2-20 个字符' });
+  if (!/^[\w\u4e00-\u9fa5-]+$/.test(name)) return res.status(400).json({ error: '用户名只能包含中文、字母、数字、下划线或短横线' });
+  if (!password || String(password).length < 6) return res.status(400).json({ error: '密码至少 6 位' });
+  if (usernameExists(name)) return res.status(409).json({ error: '用户名已被注册，换一个试试' });
+  const user = createUser(name, String(password));
+  const token = createSession(user.id);
+  res.status(201).json({ token, user });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body || {};
+  const name = String(username || '').trim();
+  const user = getUserByUsername(name);
+  if (!user || !verifyPassword(String(password || ''), user.password_hash)) {
+    return res.status(401).json({ error: '用户名或密码不正确' });
+  }
+  const token = createSession(user.id);
+  res.json({ token, user: { id: user.id, username: user.username } });
+});
+
+app.post('/api/auth/logout', requireAuth, (req, res) => {
+  deleteSession(req.token);
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({ user: req.user });
+});
+
+// ---------- 图片上传（登录用户，图片归属对应记录） ----------
+app.post('/api/upload', requireAuth, multerUpload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: '未收到图片' });
     const name = await saveImage(req.file.buffer);
@@ -54,32 +105,32 @@ app.post('/api/upload', multerUpload.single('image'), async (req, res) => {
   }
 });
 
-// ---------- 记录 CRUD ----------
+// ---------- 记录 CRUD（全部按登录用户隔离） ----------
 
 // 获取列表：支持 mood 筛选 / 年份月份筛选 / 关键词搜索；返回带趋势分与补记标记
-app.get('/api/records', (req, res) => {
+app.get('/api/records', requireAuth, (req, res) => {
   const { mood, year, month, q } = req.query;
-  const conds = [];
-  const params = [];
+  const conds = ['user_id = ?'];
+  const params = [req.user.id];
   if (mood && VALID_MOOD_KEYS.includes(mood)) { conds.push('mood = ?'); params.push(mood); }
   if (year) { conds.push("strftime('%Y', recorded_date) = ?"); params.push(String(year)); }
   if (month && year) { conds.push("strftime('%m', recorded_date) = ?"); params.push(String(month).padStart(2, '0')); }
   if (q) { conds.push('content LIKE ?'); params.push(`%${q}%`); }
-  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+  const where = 'WHERE ' + conds.join(' AND ');
   const today = new Date().toISOString().slice(0, 10);
   const rows = db.prepare(`SELECT * FROM records ${where} ORDER BY recorded_date DESC, id DESC`).all(...params);
   res.json(rows.map(r => ({ ...r, backfill: r.recorded_date < today, trend: trendScore(r.mood, r.intensity) })));
 });
 
 // 单条
-app.get('/api/records/:id', (req, res) => {
-  const r = db.prepare('SELECT * FROM records WHERE id = ?').get(Number(req.params.id));
+app.get('/api/records/:id', requireAuth, (req, res) => {
+  const r = db.prepare('SELECT * FROM records WHERE id = ? AND user_id = ?').get(Number(req.params.id), req.user.id);
   if (!r) return res.status(404).json({ error: '记录不存在' });
   res.json({ ...r, trend: trendScore(r.mood, r.intensity) });
 });
 
 // 新增
-app.post('/api/records', (req, res) => {
+app.post('/api/records', requireAuth, (req, res) => {
   const { mood, intensity = null, content = '', image = null, recorded_date = null } = req.body || {};
   if (!VALID_MOOD_KEYS.includes(mood)) return res.status(400).json({ error: '无效的心情分类' });
   let iv = intensity == null ? null : Math.max(1, Math.min(5, Number(intensity) || 3));
@@ -89,16 +140,16 @@ app.post('/api/records', (req, res) => {
   // 补记标记：recorded_date 早于今天
   const isBackfill = date < new Date().toISOString().slice(0, 10);
   const info = db.prepare(
-    'INSERT INTO records (mood, intensity, content, image, recorded_date, created_at, updated_at) VALUES (?,?,?,?,?,?,?)'
-  ).run(mood, iv, (content || '').trim(), image || null, date, now, now);
+    'INSERT INTO records (mood, intensity, content, image, recorded_date, created_at, updated_at, user_id) VALUES (?,?,?,?,?,?,?,?)'
+  ).run(mood, iv, (content || '').trim(), image || null, date, now, now, req.user.id);
   const row = db.prepare('SELECT * FROM records WHERE id = ?').get(info.lastInsertRowid);
   res.status(201).json({ ...row, backfill: isBackfill, trend: trendScore(row.mood, row.intensity) });
 });
 
 // 编辑
-app.put('/api/records/:id', (req, res) => {
+app.put('/api/records/:id', requireAuth, (req, res) => {
   const id = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM records WHERE id = ?').get(id);
+  const existing = db.prepare('SELECT * FROM records WHERE id = ? AND user_id = ?').get(id, req.user.id);
   if (!existing) return res.status(404).json({ error: '记录不存在' });
   const { mood = existing.mood, intensity = existing.intensity, content = existing.content, image = existing.image, recorded_date = existing.recorded_date } = req.body || {};
   if (!VALID_MOOD_KEYS.includes(mood)) return res.status(400).json({ error: '无效的心情分类' });
@@ -107,18 +158,18 @@ app.put('/api/records/:id', (req, res) => {
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) date = existing.recorded_date;
   const now = new Date().toISOString();
   db.prepare(
-    'UPDATE records SET mood=?, intensity=?, content=?, image=?, recorded_date=?, updated_at=? WHERE id=?'
-  ).run(mood, iv, (content || '').trim(), image || null, date, now, id);
+    'UPDATE records SET mood=?, intensity=?, content=?, image=?, recorded_date=?, updated_at=? WHERE id=? AND user_id=?'
+  ).run(mood, iv, (content || '').trim(), image || null, date, now, id, req.user.id);
   const row = db.prepare('SELECT * FROM records WHERE id = ?').get(id);
   res.json({ ...row, backfill: row.recorded_date < new Date().toISOString().slice(0, 10), trend: trendScore(row.mood, row.intensity) });
 });
 
 // 删除（同时清理图片文件）
-app.delete('/api/records/:id', (req, res) => {
+app.delete('/api/records/:id', requireAuth, (req, res) => {
   const id = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM records WHERE id = ?').get(id);
+  const existing = db.prepare('SELECT * FROM records WHERE id = ? AND user_id = ?').get(id, req.user.id);
   if (!existing) return res.status(404).json({ error: '记录不存在' });
-  db.prepare('DELETE FROM records WHERE id = ?').run(id);
+  db.prepare('DELETE FROM records WHERE id = ? AND user_id = ?').run(id, req.user.id);
   if (existing.image) {
     const file = path.join(UPLOAD_DIR, path.basename(existing.image));
     fs.existsSync(file) && fs.unlinkSync(file);
@@ -126,22 +177,22 @@ app.delete('/api/records/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- 统计聚合 ----------
-app.get('/api/stats', (req, res) => {
+// ---------- 统计聚合（按用户隔离） ----------
+app.get('/api/stats', requireAuth, (req, res) => {
   const { year, month, from, to } = req.query;
-  const conds = [];
-  const params = [];
+  const conds = ['user_id = ?'];
+  const params = [req.user.id];
   if (from) { conds.push('recorded_date >= ?'); params.push(String(from)); }
   if (to) { conds.push('recorded_date <= ?'); params.push(String(to)); }
   if (year) { conds.push("strftime('%Y', recorded_date) = ?"); params.push(String(year)); }
   if (month && year) { conds.push("strftime('%m', recorded_date) = ?"); params.push(String(month).padStart(2, '0')); }
-  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+  const where = 'WHERE ' + conds.join(' AND ');
 
   const total = db.prepare(`SELECT COUNT(*) c FROM records ${where}`).get(...params).c;
   const days = db.prepare(`SELECT COUNT(DISTINCT recorded_date) c FROM records ${where}`).get(...params).c;
 
   // 连续记录天数（截至今天的连续打卡，基于全部记录）
-  const streak = calcStreak();
+  const streak = calcStreak(req.user.id);
 
   // 心情分布
   const dist = db.prepare(`SELECT mood, COUNT(*) c FROM records ${where} GROUP BY mood`).all(...params);
@@ -167,8 +218,8 @@ app.get('/api/stats', (req, res) => {
   res.json({ total, days, streak, moodDist, intensityDist, byDay });
 });
 
-function calcStreak() {
-  const rows = db.prepare('SELECT DISTINCT recorded_date d FROM records ORDER BY d DESC').all();
+function calcStreak(userId) {
+  const rows = db.prepare('SELECT DISTINCT recorded_date d FROM records WHERE user_id = ? ORDER BY d DESC').all(userId);
   if (!rows.length) return 0;
   const days = rows.map(r => r.d);
   // 今天有记录则从今天数，否则从昨天数（今天还没记不算断）
@@ -193,23 +244,23 @@ function addDays(dateStr, n) {
 }
 
 // 年度热力图数据：整年每天记录强度
-app.get('/api/heatmap', (req, res) => {
+app.get('/api/heatmap', requireAuth, (req, res) => {
   const year = Number(req.query.year) || new Date().getFullYear();
   const rows = db.prepare(`
     SELECT recorded_date day, COUNT(*) c, AVG(intensity) avg_intensity
-    FROM records WHERE strftime('%Y', recorded_date) = ?
+    FROM records WHERE user_id = ? AND strftime('%Y', recorded_date) = ?
     GROUP BY recorded_date
-  `).all(String(year));
+  `).all(req.user.id, String(year));
   res.json({ year, days: rows.map(r => ({ day: r.day, count: r.c, avgIntensity: Math.round((r.avg_intensity || 0) * 10) / 10 })) });
 });
 
-// ---------- 导出 ----------
-function allRecords() {
-  return db.prepare('SELECT * FROM records ORDER BY recorded_date DESC, id DESC').all();
+// ---------- 导出（按登录用户隔离） ----------
+function allRecords(userId) {
+  return db.prepare('SELECT * FROM records WHERE user_id = ? ORDER BY recorded_date DESC, id DESC').all(userId);
 }
 
-app.get('/api/export/json', (req, res) => {
-  const data = allRecords().map(r => ({
+app.get('/api/export/json', requireAuth, (req, res) => {
+  const data = allRecords(req.user.id).map(r => ({
     id: r.id, mood: r.mood, intensity: r.intensity, content: r.content,
     image: r.image ? `/uploads/${path.basename(r.image)}` : null,
     recorded_date: r.recorded_date, created_at: r.created_at, updated_at: r.updated_at
@@ -219,8 +270,8 @@ app.get('/api/export/json', (req, res) => {
   res.send(JSON.stringify({ app: '心情笔记', exported_at: new Date().toISOString(), records: data }, null, 2));
 });
 
-app.get('/api/export/csv', (req, res) => {
-  const rows = allRecords();
+app.get('/api/export/csv', requireAuth, (req, res) => {
+  const rows = allRecords(req.user.id);
   const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const lines = ['id,mood,intensity,content,image,recorded_date,created_at,updated_at'];
   for (const r of rows) {
